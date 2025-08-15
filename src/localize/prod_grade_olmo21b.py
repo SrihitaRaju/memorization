@@ -35,8 +35,11 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# Extend sys.path to project root for evaluators/baseline imports
+# Extend sys.path to prefer local copies under src/localize/, then fall back to project root
 import sys
+LOCAL_DIR = os.path.dirname(__file__)
+if LOCAL_DIR not in sys.path:
+    sys.path.insert(0, LOCAL_DIR)
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
@@ -445,7 +448,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ndcg_text",
         type=str,
-        default=os.path.join(REPO_ROOT, "data", "pile10k_None.txt"),
+        default=os.path.join(os.path.dirname(__file__), "data", "pile10k_None.txt"),
         help="Path to pile10k text for nDCG (independent of clean_mode)"
     )
     parser.add_argument("--lev_limit", type=int, default=512, help="max mem examples for Levenshtein eval (None for all)")
