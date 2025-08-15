@@ -26,7 +26,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.nn import CrossEntropyLoss
 import numpy as np
-from transformers import GPT2Config, GPT2Model, GPT2LMHeadModel
+# Avoid importing GPT-2 classes globally; not required for Pythia path
 
 import copy
 import math

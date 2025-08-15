@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import datasets, transforms
+# torchvision not required for this code path; avoid heavy dep
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.autograd as autograd
 import copy
@@ -61,7 +61,11 @@ class Conv1D(nn.Module):
 
     def forward(self, x):
         size_out = x.size()[:-1] + (self.nf,)
-        x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
+        x2d = x.view(-1, x.size(-1))
+        if getattr(self, "bias", None) is not None:
+            x = torch.addmm(self.bias, x2d, self.weight)
+        else:
+            x = x2d.matmul(self.weight)
         x = x.view(size_out)
         return x
 
@@ -94,22 +98,29 @@ class SupermaskConv(Conv1D):
         subnet = GetSubnet.apply(self.scores.abs(), self.sparsity).to(
             self.weight.device
         )
-        if "gpt" in self.model_name:
+        name = self.model_name.lower()
+        if "gpt" in name:
             w = self.weight * subnet
-        if "pythia" in self.model_name:
+        elif "pythia" in name:
+            w = self.weight.T * subnet
+        elif "olmo" in name:
             w = self.weight.T * subnet
         # NOTE(ms): need to ensure dtype match
         w = w.to(self.weight.dtype)
-
         size_out = x.size()[:-1] + (self.nf,)
-        x = torch.addmm(self.bias, x.view(-1, x.size(-1)), w)
+        x2d = x.view(-1, x.size(-1))
+        if getattr(self, "bias", None) is not None:
+            x = torch.addmm(self.bias, x2d, w)
+        else:
+            x = x2d.matmul(w)
         x = x.view(size_out)
         return x
 
 
-def mask_model(model, n_layers, ratio, model_name="gpt2"):
+def mask_model(model, n_layers, ratio, model_name="gpt2", include_gate: bool = False):
     for layer in range(n_layers):
-        if "gpt" in model_name:
+        name = model_name.lower()
+        if "gpt" in name:
             # make mask
             mask = SupermaskConv(ratio, model_name, 512, 128).to(device)
             # assign old weights to mask
@@ -125,7 +136,7 @@ def mask_model(model, n_layers, ratio, model_name="gpt2"):
             mask.bias = model.transformer.h[layer].mlp.c_proj.bias
             # assign mask to layer
             model.transformer.h[layer].mlp.c_proj = copy.deepcopy(mask)
-        if "pythia" in model_name:
+        elif "pythia" in name:
             # make mask
             # TODO (MS): don't hardcode pythia dims cus many different model sizes
             weight_shape = model.gpt_neox.layers[layer].mlp.dense_h_to_4h.weight.shape
@@ -150,17 +161,48 @@ def mask_model(model, n_layers, ratio, model_name="gpt2"):
             mask.bias = model.gpt_neox.layers[layer].mlp.dense_4h_to_h.bias
             # assign mask to layer
             model.gpt_neox.layers[layer].mlp.dense_4h_to_h = copy.deepcopy(mask)
+        elif "olmo" in name:
+            # up_proj: weight shape (out=intermediate, in=hidden)
+            weight_shape = model.model.layers[layer].mlp.up_proj.weight.shape
+            mask = SupermaskConv(
+                ratio, name, weight_shape[0], weight_shape[1]
+            ).to(device)
+            mask.weight = model.model.layers[layer].mlp.up_proj.weight
+            mask.bias = model.model.layers[layer].mlp.up_proj.bias
+            model.model.layers[layer].mlp.up_proj = copy.deepcopy(mask)
+
+            # down_proj: weight shape (out=hidden, in=intermediate)
+            weight_shape = model.model.layers[layer].mlp.down_proj.weight.shape
+            # For Conv1D-style (in,out) multiplication with w = weight.T,
+            # scores/subnet must have shape (in, out) = (intermediate, hidden)
+            mask = SupermaskConv(
+                ratio, name, weight_shape[0], weight_shape[1]
+            ).to(device)
+            mask.weight = model.model.layers[layer].mlp.down_proj.weight
+            mask.bias = model.model.layers[layer].mlp.down_proj.bias
+            model.model.layers[layer].mlp.down_proj = copy.deepcopy(mask)
+
+            # optional: gate_proj has same shape pattern as up_proj (out=intermediate, in=hidden)
+            if include_gate and hasattr(model.model.layers[layer].mlp, "gate_proj"):
+                weight_shape = model.model.layers[layer].mlp.gate_proj.weight.shape
+                mask = SupermaskConv(
+                    ratio, name, weight_shape[0], weight_shape[1]
+                ).to(device)
+                mask.weight = model.model.layers[layer].mlp.gate_proj.weight
+                mask.bias = getattr(model.model.layers[layer].mlp.gate_proj, "bias", None)
+                model.model.layers[layer].mlp.gate_proj = copy.deepcopy(mask)
         # print("Masked layer: ", layer)
 
     return model
 
 
-def get_base_edited_model(model, n_layers, model_name):
+def get_base_edited_model(model, n_layers, model_name, include_gate: bool = False):
     """This is how we merge the mask into the base weights
     rather than, having a scores attribute"""
 
     for layer in range(n_layers):
-        if "gpt" in model_name:
+        name = model_name.lower()
+        if "gpt" in name:
             # grab mask
             mask = model.transformer.h[layer].mlp.c_fc
             # assign edited weights to base model
@@ -184,7 +226,7 @@ def get_base_edited_model(model, n_layers, model_name):
             model.transformer.h[layer].mlp.c_proj.weight = torch.nn.Parameter(w)
             # assign bias to base model
             model.transformer.h[layer].mlp.c_proj.bias = mask.bias
-        if "pythia" in model_name:
+        elif "pythia" in name:
             mask = model.gpt_neox.layers[layer].mlp.dense_h_to_4h
             # assign edited weights to base model
             subnet = GetSubnet.apply(mask.scores.abs(), mask.sparsity).to(
@@ -222,6 +264,50 @@ def get_base_edited_model(model, n_layers, model_name):
             )
             # assign bias to base model
             model.gpt_neox.layers[layer].mlp.dense_4h_to_h.bias = mask.bias
+        elif "olmo" in name:
+            # up_proj
+            mask = model.model.layers[layer].mlp.up_proj
+            subnet = GetSubnet.apply(mask.scores.abs(), mask.sparsity).to(
+                mask.weight.device
+            )
+            w = mask.weight.T * subnet
+            w = w.to(mask.weight.dtype)
+            weight_shape = model.model.layers[layer].mlp.up_proj.weight.shape
+            model.model.layers[layer].mlp.up_proj = Conv1D(
+                weight_shape[0], weight_shape[1]
+            ).to(device)
+            model.model.layers[layer].mlp.up_proj.weight = torch.nn.Parameter(w)
+            model.model.layers[layer].mlp.up_proj.bias = mask.bias
+
+            # down_proj
+            mask = model.model.layers[layer].mlp.down_proj
+            subnet = GetSubnet.apply(mask.scores.abs(), mask.sparsity).to(
+                mask.weight.device
+            )
+            w = mask.weight.T * subnet
+            w = w.to(mask.weight.dtype)
+            weight_shape = model.model.layers[layer].mlp.down_proj.weight.shape
+            # down_proj: out=hidden, in=intermediate → nf=out, nx=in
+            model.model.layers[layer].mlp.down_proj = Conv1D(
+                weight_shape[0], weight_shape[1]
+            ).to(device)
+            model.model.layers[layer].mlp.down_proj.weight = torch.nn.Parameter(w)
+            model.model.layers[layer].mlp.down_proj.bias = mask.bias
+
+            # optional: gate_proj
+            if include_gate and hasattr(model.model.layers[layer].mlp, "gate_proj"):
+                mask = model.model.layers[layer].mlp.gate_proj
+                subnet = GetSubnet.apply(mask.scores.abs(), mask.sparsity).to(
+                    mask.weight.device
+                )
+                w = mask.weight.T * subnet
+                w = w.to(mask.weight.dtype)
+                weight_shape = w.T.shape  # original weight shape
+                model.model.layers[layer].mlp.gate_proj = Conv1D(
+                    weight_shape[0], weight_shape[1]
+                ).to(device)
+                model.model.layers[layer].mlp.gate_proj.weight = torch.nn.Parameter(w)
+                model.model.layers[layer].mlp.gate_proj.bias = getattr(mask, "bias", None)
 
     return model
 

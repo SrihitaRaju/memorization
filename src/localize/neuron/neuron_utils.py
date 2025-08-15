@@ -2,7 +2,6 @@ import torch
 from torch.utils.data import DataLoader
 from torch.nn import CrossEntropyLoss
 import numpy as np
-from transformers import GPT2Config, GPT2Model, GPT2LMHeadModel
 
 from tqdm import tqdm
 import copy
@@ -223,6 +222,7 @@ def accuracy(inputs, logits):
 def perplexity(dataloader, model):
     avg_metric = 0
     for batch in dataloader:
+        batch = batch.to(model.device)
         with torch.no_grad():
             model_output = model(batch, labels=batch)
         loss = model_output.loss
@@ -553,6 +553,11 @@ def track_all_metrics(
 
 
 def get_model(model_path, n_layer, max_ctx, n_embed, vocab_size):
+    # Lazy import GPT2 classes only if this helper is actually used
+    try:
+        from transformers import GPT2Config, GPT2LMHeadModel  # type: ignore
+    except Exception as e:
+        raise ImportError("GPT2 classes are unavailable; this helper is only for GPT-2 toy models.") from e
     # layer_dir = "two_layer"
     n_layer = n_layer
     # epoch = 200

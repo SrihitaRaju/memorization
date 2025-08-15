@@ -8,9 +8,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import datasets, transforms
+# NOTE: torchvision is not required for this path; avoid importing to reduce deps
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.autograd as autograd
+import numpy as np
+import random
 import copy
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -33,6 +35,9 @@ def train(model, device, train_dataloader, optimizer, batch_size, loss_weighting
     # train_dataloader = DataLoader(noise_data, batch_size=64, shuffle=False)
     # for batch_idx, (data, target) in enumerate(train_loader):
     for batch, label in train_dataloader:
+        batch = batch.to(model.device)
+        if isinstance(label, torch.Tensor):
+            label = label.to(model.device)
         optimizer.zero_grad()
         model_output = model(batch, labels=batch)
         train_logits = model_output.logits
@@ -68,7 +73,21 @@ def do_random_greedy(
     batch_size=64,
     loss_weighting=0.05,
     model_name="gpt2",
+    seed: int | None = None,
+    include_gate: bool = False,
 ):
+    # Optional reproducibility
+    if seed is not None:
+        try:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            np.random.seed(seed)
+            random.seed(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        except Exception:
+            pass
     clean_labels = [-1] * len(clean_data)
     noise_labels = [1] * len(noise_data)
     train_datasets = (noise_data, clean_data)
@@ -80,14 +99,20 @@ def do_random_greedy(
     for i in range(len(train_labels)):
         train_datas.append([train_data[i], train_labels[i]])
 
-    train_dataloader = DataLoader(train_datas, batch_size=batch_size, shuffle=True)
+    # Deterministic shuffling if seed provided
+    if seed is not None:
+        g = torch.Generator()
+        g.manual_seed(seed)
+        train_dataloader = DataLoader(train_datas, batch_size=batch_size, shuffle=True, generator=g)
+    else:
+        train_dataloader = DataLoader(train_datas, batch_size=batch_size, shuffle=True)
 
     # make model params grad frozen
     for name, param in model.named_parameters():
         param.requires_grad = False
 
     # model = mask_model(model, n_layers, ratio)
-    model = mask_model(model, n_layers, ratio, model_name)
+    model = mask_model(model, n_layers, ratio, model_name, include_gate=include_gate)
 
     optimizer = optim.SGD(
         [p for p in model.parameters() if p.requires_grad],
@@ -100,5 +125,5 @@ def do_random_greedy(
         # print("EPOCH: ", i)
         train(model, device, train_dataloader, optimizer, batch_size, loss_weighting)
 
-    model = get_base_edited_model(model, n_layers, model_name)
+    model = get_base_edited_model(model, n_layers, model_name, include_gate=include_gate)
     return model

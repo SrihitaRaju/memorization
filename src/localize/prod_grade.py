@@ -29,12 +29,42 @@ from neuron.integrated_gradients import (
 from weight.greedy import do_greedy, get_new_grads
 from weight.durable import do_durable
 from weight.obs import do_obs
-from weight.random_subnet import do_random
 from weight.random_subnet_greedy import do_random_greedy
 
-from localizing_memorization import check_existance, check_basic_stats_existance
+# Avoid importing localizing_memorization to prevent GPT2 deps; re‑define minimal helpers here
+def check_basic_stats_existance(dict_of_values, df):
+    exists = False
+    model_path = dict_of_values.get("model_path")
+    if model_path is not None and "model_path" in df.columns:
+        exists = model_path in df["model_path"].unique()
+    return exists
 
-from src.data.old_data import divide_chunks, get_data
+def check_existance(dict_of_values, df):
+    v = df.iloc[:, 0] == df.iloc[:, 0]
+    for key, value in dict_of_values.items():
+        if key in df.columns:
+            v &= df[key] == value
+    return v.any()
+
+# Minimal inline replacements to avoid importing GPT2-heavy old_data
+def divide_chunks(l, n):
+    for i in range(0, len(l), n):
+        yield l[i:i + n]
+
+def get_data(**kwargs):
+    # For production Pythia path we do not use old_data; instead, rely on released Pile tensors.
+    # This shim returns pre-tokenized tensors expected later in this script.
+    # Load from packaged data dir
+    import torch, os
+    data_dir = os.path.join(os.path.dirname(__file__), "..", "data", "pythia_mem_data")
+    model_name = kwargs.get("model_name", "EleutherAI/pythia-2.8b-deduped-v0")
+    if "2.8b" in model_name or "2" in model_name:
+        dedup = os.path.join(data_dir, "pythia-2.8b-deduped-v0", "pile_bs0-100-dedup.pt")
+    else:
+        dedup = os.path.join(data_dir, "pythia-6.9b-deduped", "pile_bs0-100-dedup.pt")
+    noise = torch.load(os.path.join(data_dir, "pile_random_batch.pt"))
+    # conform to expected tuple
+    return None, None, [None, noise], [None, None], [noise, noise, noise, noise], None, None
 from src.localize.weight.weight_utils import clm_loss_fn, count_num_params
 import copy
 
@@ -126,17 +156,8 @@ if __name__ == "__main__":
         "--localization_method",
         type=str,
         default="hc",
-        choices=[
-            "greedy",
-            "durable",
-            "durable_agg",
-            "random",
-            "random_greedy",
-            "act",
-            "slim",
-            "hc",
-        ],
-        help="Path to model ckpt file",
+        choices=["greedy","durable","durable_agg","random_greedy","act","slim","hc"],
+        help="Localization method",
     )
     parser.add_argument(
         "--ratio",
@@ -224,13 +245,12 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Get data
+    # Get data (resolve relative to this file to avoid CWD issues)
+    data_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "data", "pythia_mem_data"))
     if "2" in args.model_name:
-        data_path = (
-            "../data/pythia_mem_data/pythia-2.8b-deduped-v0/pile_bs0-100-dedup.pt"
-        )
+        data_path = os.path.join(data_root, "pythia-2.8b-deduped-v0", "pile_bs0-100-dedup.pt")
     if "6" in args.model_name:
-        data_path = "../data/pythia_mem_data/pythia-6.9b-deduped/pile_bs0-100-dedup.pt"
+        data_path = os.path.join(data_root, "pythia-6.9b-deduped", "pile_bs0-100-dedup.pt")
     args.model_path = f"../../model_ckpts/{args.step}/{args.model_name}"
     print("Model path: ", args.model_path)
 
@@ -241,6 +261,7 @@ if __name__ == "__main__":
     model_path = model_path + "_edit/"
     args.results_path = f"{model_path}localization_results_{args.step}.csv"
     print("results path: ", args.results_path)
+    experiment_exists = False
     if os.path.exists(args.results_path):
         print("checking if experiment stats are in resutls file")
         existing_results = pd.read_csv(args.results_path)
@@ -250,12 +271,12 @@ if __name__ == "__main__":
         ckpt_check_df = existing_results[data.keys()]
         exists = check_existance(data, ckpt_check_df)
         print("This experiment exists: ", exists)
-        if exists:
-            exit()
+        # Do not exit; we will recompute and print BEFORE MASKING stats but skip duplicate writes later
+        experiment_exists = bool(exists)
 
     data = torch.load(data_path).to(device)
     unlearn_set = copy.deepcopy(data)
-    random_data = torch.load("../data/pythia_mem_data/pile_random_batch.pt").to(device)
+    random_data = torch.load(os.path.join(data_root, "pile_random_batch.pt")).to(device)
     random_data_pile = torch.reshape(random_data[0:2040], (3264, 80))
     random_data = random_data_pile[0:1632]
     extra_data = random_data_pile[1632:]
@@ -363,24 +384,23 @@ if __name__ == "__main__":
         os.makedirs(model_path)
     mem_seq_path = f"{model_path}mem_seq_{os.path.basename(args.model_path)}"
 
-    # the base experiment exists so load it from the path
-    if exists:
-        mem_seq = torch.load(mem_seq_path)
     print("path for memorized sequences: ", mem_seq_path)
 
+    # Always compute BEFORE MASKING stats (perc_mem and random-batch perplexity)
+    percent_mem, mem_seq, perp = check_percent_memorized(
+        dataset=unlearn_set,
+        random_dataloader=random_dataloader,
+        prompt_len=32,
+        k=40,
+        batch_size=64,
+        model=model,
+        max_ctx=80,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+    # Only save base artifacts/rows if basic stats were not recorded before
     base = 0
     if not exists:
-        percent_mem, mem_seq, perp = check_percent_memorized(
-            dataset=unlearn_set,
-            random_dataloader=random_dataloader,
-            prompt_len=32,
-            k=40,
-            batch_size=64,
-            model=model,
-            max_ctx=80,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
         # Save mem_seq in edited model_path
         torch.save(mem_seq, mem_seq_path)
 
@@ -654,18 +674,22 @@ if __name__ == "__main__":
             print("appending only experiment not base results")
             result = pd.concat([ablate_df], axis=0, ignore_index=True)
 
-        # Now open results.csv if it exisits and append
-        if os.path.exists(args.results_path):
-            print("appending to existing results file")
-            existing_results = pd.read_csv(args.results_path)
-            existing_results = pd.concat(
-                [existing_results, result], axis=0, ignore_index=True
-            )
-            existing_results.to_csv(args.results_path, index=False)
-        # Otherwise make a new results.csv
+        # Skip duplicate writes if the exact experiment already exists
+        if experiment_exists:
+            print("experiment already exists; skipping CSV write to avoid duplicates")
         else:
-            print("making new results file")
-            result.to_csv(args.results_path, index=False)
+            # Now open results.csv if it exisits and append
+            if os.path.exists(args.results_path):
+                print("appending to existing results file")
+                existing_results = pd.read_csv(args.results_path)
+                existing_results = pd.concat(
+                    [existing_results, result], axis=0, ignore_index=True
+                )
+                existing_results.to_csv(args.results_path, index=False)
+            # Otherwise make a new results.csv
+            else:
+                print("making new results file")
+                result.to_csv(args.results_path, index=False)
 
     # if we don't have anything in our mem seq, then we can still add our base_stats
     if len(unlearn_set) == 0:

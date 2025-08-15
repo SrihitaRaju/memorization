@@ -46,7 +46,7 @@ from neuron.integrated_gradients import (
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
-from transformers import GPT2Config, GPT2Model, GPT2LMHeadModel
+# Avoid importing GPT-2 classes globally; not required for Pythia runs
 
 from tqdm import tqdm
 import copy
